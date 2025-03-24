@@ -58,6 +58,7 @@ from vllm.transformers_utils.s3_utils import glob as s3_glob
 from vllm.transformers_utils.utils import is_s3
 from vllm.utils import is_pin_memory_available
 
+LOW_CPU_MEM = os.environ.get("LOW_CPU_MEM", "0") == "1"
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module,
@@ -428,21 +429,25 @@ class DefaultModelLoader(BaseModelLoader):
             with target_device:
                 model = _initialize_model(vllm_config=vllm_config)
 
-            logger.info("Loading weights on %s...", load_device)
-            weights_to_load = {name for name, _ in model.named_parameters()}
-            loaded_weights = model.load_weights(
-                self._get_all_weights(model_config, model))
-            # We only enable strict check for non-quantized models
-            # that have loaded weights tracking currently.
-            if model_config.quantization is None and loaded_weights is not None:
-                weights_not_loaded = weights_to_load - loaded_weights
-                if weights_not_loaded:
-                    warning_msg = f"Following weights were not initialized \
-                            from checkpoint: {weights_not_loaded}"
+            if not LOW_CPU_MEM:
+                logger.info("Loading weights on %s...", load_device)
+                weights_to_load = {name for name, _ in model.named_parameters()}
+                loaded_weights = model.load_weights(
+                    self._get_all_weights(model_config, model))
+                # We only enable strict check for non-quantized models
+                # that have loaded weights tracking currently.
+                if model_config.quantization is None and loaded_weights is not None:
+                    weights_not_loaded = weights_to_load - loaded_weights
+                    if weights_not_loaded:
+                        warning_msg = f"Following weights were not initialized \
+                                from checkpoint: {weights_not_loaded}"
 
-                    logger.warning(warning_msg)
+                        logger.warning(warning_msg)
 
-            _process_weights_after_loading(model, model_config, target_device)
+                _process_weights_after_loading(model, model_config, target_device)
+            else:
+                model = model.to("meta")
+                setattr(model, "weights_mapping", dict(list(self._get_all_weights(model_config, model))))
         if vllm_config.cache_config.cache_dtype == "fp8_inc":
             from neural_compressor.torch.algorithms.fp8_quant._quant_common.helper_modules import PatchedVLLMKVCache
             from neural_compressor.torch.algorithms.fp8_quant._quant_common.quant_config import Fp8cfg

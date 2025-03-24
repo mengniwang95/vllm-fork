@@ -24,6 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
+import os
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -58,6 +59,7 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+LOW_CPU_MEM = os.environ.get("LOW_CPU_MEM", "0") == "1"
 is_hpu = current_platform.is_hpu()
 
 

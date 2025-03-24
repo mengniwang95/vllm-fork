@@ -4,8 +4,11 @@ from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
+import os
 import torch
-
+import habana_frameworks.torch as htorch
+import torch.nn.functional as F
+from vllm_hpu_extension.ops import VllmMixtureOfExpertsOp
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
@@ -29,6 +32,55 @@ if current_platform.is_tpu():
 else:
     fused_moe_pallas = None  # type: ignore
 logger = init_logger(__name__)
+
+
+class DynamicFusedMOE(torch.nn.Module):
+
+    def __init__(self, num_total_experts, moe_n_slice):
+        super().__init__()
+        # self.MoeOp = VllmMixtureOfExpertsOp(num_total_experts)
+        self.num_experts = num_total_experts
+        self.moe_n_slice = moe_n_slice
+        if self.moe_n_slice == 1:
+            self.MoeOp = torch.nn.ModuleList(
+                [VllmMixtureOfExpertsOp(self.num_experts)]
+            )
+        else:
+            assert self.num_experts % self.moe_n_slice == 0, "moe_n_slice can't be divided by {}".format(self.num_experts)
+            self.MoeOp = torch.nn.ModuleList(
+                [VllmMixtureOfExpertsOp(self.moe_n_slice) for _ in range(self.num_experts // self.moe_n_slice)]
+            )
+
+    def forward(self, hidden_states, score, topk, experts_min=0, experts_max=7):
+        htorch.core.mark_step()
+        routing_weights = F.softmax(score, dim=1, dtype=torch.float32)
+        routing_weights, selected_experts = torch.topk(routing_weights,
+                                                        topk,
+                                                        dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        n_expert_slice = self.num_experts // self.moe_n_slice
+        assert n_expert_slice * self.moe_n_slice == self.num_experts
+        for i in range(self.moe_n_slice):
+            min_expert = i * n_expert_slice
+            max_expert = (i + 1) * n_expert_slice
+            current_hidden_states = self.MoeOp[i](
+                hidden_states=hidden_states,
+                expert_routing_table=selected_experts,
+                router_weights=routing_weights,
+                permuted_weights=True,
+                activation="silu",
+                experts_min=min_expert,
+                experts_max=max_expert,
+            )
+            htorch.core.mark_step()
+            if i == 0:
+                final_hidden_states = current_hidden_states
+            else:
+                final_hidden_states.add_(current_hidden_states)
+
+        return final_hidden_states.view(-1, hidden_states.shape[1])
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -117,7 +169,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        ep_rank = 0
     ) -> torch.Tensor:
         return self.forward(x=x,
                             layer=layer,
@@ -129,7 +182,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                             num_expert_group=num_expert_group,
                             custom_routing_function=custom_routing_function,
                             scoring_func=scoring_func,
-                            e_score_correction_bias=e_score_correction_bias)
+                            e_score_correction_bias=e_score_correction_bias,
+                            ep_rank=ep_rank)
 
     def forward_cuda(
         self,
@@ -176,8 +230,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        ep_rank = 0
     ):
+        x = x.reshape(x.shape[-1])
         assert len(x.shape) == 2
         import habana_frameworks.torch as htorch
         htorch.core.mark_step()
@@ -201,41 +257,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                                                         dim=-1)
             topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(x.dtype)
-
-        final_hidden_states = torch.zeros_like(x)
-        num_experts = layer.w13_weight.shape[0]
-        n_expert_slice = layer.w13_weight.shape[0] // 8
-        assert n_expert_slice * 8 == num_experts
-
-        # w13_list = layer.hpu_fused_moe.MoeOp.w13_list
-        # w2_list = layer.hpu_fused_moe.MoeOp.w2_list
-
-        for i in range(8):
-            min_expert = i * n_expert_slice
-            max_expert = (i + 1) * n_expert_slice
-            # w13_list_slice = [w13_list[i].weight.squeeze() for i in range(min_expert, max_expert)]
-            # w2_list_slice = [w2_list[i].weight.squeeze() for i in range(min_expert, max_expert)]
-            w13_list_slice = [layer.w13_weight[j].squeeze().clone() for j in range(min_expert, max_expert)]
-            w2_list_slice = [layer.w2_weight[j].squeeze().clone() for j in range(min_expert, max_expert)]
-            # print(f"w13_list_slice[0].shape: {w13_list_slice[0].shape}, device: {w13_list_slice[0].device}, dtype: {w13_list_slice[0].dtype}")
-            # print(f"w2_list_slice[0].shape: {w2_list_slice[0].shape}, device: {w2_list_slice[0].device}, dtype: {w2_list_slice[0].dtype}")
-            # print(f"hidden_states.shape: {x.shape}, device: {x.device}, dtype: {x.dtype}")
-            # print(f"topk_ids.shape: {topk_ids.shape}, device: {topk_ids.device}, dtype: {topk_ids.dtype}")
-            # print(f"topk_weights.shape: {topk_weights.shape}, device: {topk_weights.device}, dtype: {topk_weights.dtype}")
-            # print(f"min_expert: {min_expert}, max_expert: {max_expert}")
-            final_hidden_states += torch.ops.hpu.mixture_of_experts(hidden_states=x,
-                                         expert_routing_table=topk_ids.to(torch.int64),
-                                         router_weights=topk_weights.to(x.dtype),
-                                         w12=w13_list_slice,
-                                         w3=w2_list_slice,
-                                         permuted_weights=True,
-                                         activation="silu",
-                                         experts_min=min_expert,
-                                         experts_max=max_expert - 1)
-            # print(f"final_hidden_states.shape: {final_hidden_states.shape}, device: {final_hidden_states.device}, dtype: {final_hidden_states.dtype}")
-            htorch.core.mark_step()
-            # print(f"done mark step {i}")
-        return final_hidden_states.view(-1, x.shape[1])
+        final_hidden_states = layer.hpu_fused_moe(
+            hidden_states=x,
+            expert_routing_table=topk_ids.to(torch.int64),
+            router_weights=topk_weights.to(x.dtype),
+            permuted_weights=True,
+            activation="silu",
+        )
+        return final_hidden_states
 
     def forward_cpu(
         self,
@@ -360,9 +389,11 @@ class FusedMoE(torch.nn.Module):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
+        self.moe_n_slice = int(os.environ.get("VLLM_MOE_N_SLICE", 4))
+        self.n_expert_slice = self.num_experts // self.moe_n_slice
         if is_hpu:
-            from vllm_hpu_extension.ops import DynamicFusedMOE
-            self.hpu_fused_moe = DynamicFusedMOE(self.num_experts)
+            # from vllm_hpu_extension.ops import DynamicFusedMOE
+            self.hpu_fused_moe = DynamicFusedMOE(self.num_experts, self.moe_n_slice)
 
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
@@ -482,7 +513,7 @@ class FusedMoE(torch.nn.Module):
         expert_data.copy_(loaded_weight)
 
         if is_hpu:
-            self.hpu_fused_moe.MoeOp.w13_list[expert_id].set_weight(
+            self.hpu_fused_moe.MoeOp[expert_id // self.n_expert_slice].w13_list[expert_id % self.n_expert_slice].set_weight(
                 orig_exp_data)
             # print(f"loaded w13 for hpu for expert_id: {expert_id}, orig_exp_data.shape: {orig_exp_data.shape}")
 
@@ -505,7 +536,7 @@ class FusedMoE(torch.nn.Module):
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
         if is_hpu:
-            self.hpu_fused_moe.MoeOp.w2_list[expert_id].set_weight(expert_data)
+            self.hpu_fused_moe.MoeOp[expert_id // self.n_expert_slice].w2_list[expert_id % self.n_expert_slice].set_weight(expert_data)
             # print(f"loaded w2 for hpu for expert_id: {expert_id}, expert_data.shape: {expert_data.shape}")
 
     def _load_single_value(self, param: torch.nn.Parameter,

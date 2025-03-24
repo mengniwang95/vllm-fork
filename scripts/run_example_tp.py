@@ -14,7 +14,7 @@ file_path = os.path.abspath(__file__)
 dataset_path = os.path.join(os.path.dirname(file_path), "../benchmarks")
 
 model_path = "/data/models/DeepSeek-R1-static/"
-
+model_path = "/data/models/DeepSeek-R1-bf16/"
 # Parse the command-line arguments.
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default=model_path, help="The model path.")
@@ -197,6 +197,8 @@ if __name__ == "__main__":
             trust_remote_code=True,
             max_model_len=16384,
             dtype="bfloat16",
+            weights_load_device="cpu",
+            quantization="inc",
             gpu_memory_utilization=0.8,
             **param
         )
