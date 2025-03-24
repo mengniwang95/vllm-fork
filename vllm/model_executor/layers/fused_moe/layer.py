@@ -33,6 +33,7 @@ else:
     fused_moe_pallas = None  # type: ignore
 logger = init_logger(__name__)
 
+LOW_CPU_MEM = os.environ.get("LOW_CPU_MEM", "0") == "1"
 
 class DynamicFusedMOE(torch.nn.Module):
 
@@ -391,10 +392,6 @@ class FusedMoE(torch.nn.Module):
         self.custom_routing_function = custom_routing_function
         self.moe_n_slice = int(os.environ.get("VLLM_MOE_N_SLICE", 4))
         self.n_expert_slice = self.num_experts // self.moe_n_slice
-        if is_hpu:
-            # from vllm_hpu_extension.ops import DynamicFusedMOE
-            self.hpu_fused_moe = DynamicFusedMOE(self.num_experts, self.moe_n_slice)
-
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
@@ -422,6 +419,26 @@ class FusedMoE(torch.nn.Module):
             moe_quant_params["intermediate_size_full"] = intermediate_size
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        if is_hpu:
+            # from vllm_hpu_extension.ops import DynamicFusedMOE
+            self.hpu_fused_moe = DynamicFusedMOE(self.num_experts, self.moe_n_slice)
+            if LOW_CPU_MEM:
+                for i in range(self.moe_n_slice):
+                    for j in range(self.num_experts):
+                        self.hpu_fused_moe.MoeOp[i].w13_list[j % self.n_expert_slice].set_weight(
+                            torch.nn.Parameter(torch.empty(
+                             self.w13_weight[j].shape,
+                             dtype=self.w13_weight[j].dtype,
+                             ),
+                                  requires_grad=False)
+                        )
+                        self.hpu_fused_moe.MoeOp[i].w2_list[j % self.n_expert_slice].set_weight(
+                            torch.nn.Parameter(torch.empty(
+                             self.w2_weight[j].shape,
+                             dtype=self.w2_weight[j].dtype,
+                             ),
+                                  requires_grad=False)
+                        )
 
     def _load_per_tensor_weight_scale(self, shard_id: str,
                                       param: torch.nn.Parameter,
@@ -512,9 +529,9 @@ class FusedMoE(torch.nn.Module):
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
         expert_data.copy_(loaded_weight)
 
-        if is_hpu:
-            self.hpu_fused_moe.MoeOp[expert_id // self.n_expert_slice].w13_list[expert_id % self.n_expert_slice].set_weight(
-                orig_exp_data)
+        # if is_hpu:
+        #     self.hpu_fused_moe.MoeOp[expert_id // self.n_expert_slice].w13_list[expert_id % self.n_expert_slice].set_weight(
+        #         orig_exp_data)
             # print(f"loaded w13 for hpu for expert_id: {expert_id}, orig_exp_data.shape: {orig_exp_data.shape}")
 
     def _load_w2(self,
@@ -535,8 +552,9 @@ class FusedMoE(torch.nn.Module):
                                                  shard_size)
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
-        if is_hpu:
-            self.hpu_fused_moe.MoeOp[expert_id // self.n_expert_slice].w2_list[expert_id % self.n_expert_slice].set_weight(expert_data)
+
+        # if is_hpu:
+        #     self.hpu_fused_moe.MoeOp[expert_id // self.n_expert_slice].w2_list[expert_id % self.n_expert_slice].weight.data = loaded_weight
             # print(f"loaded w2 for hpu for expert_id: {expert_id}, expert_data.shape: {expert_data.shape}")
 
     def _load_single_value(self, param: torch.nn.Parameter,

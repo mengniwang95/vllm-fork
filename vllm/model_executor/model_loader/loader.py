@@ -446,8 +446,8 @@ class DefaultModelLoader(BaseModelLoader):
 
                 _process_weights_after_loading(model, model_config, target_device)
             else:
-                model = model.to("meta")
                 setattr(model, "weights_mapping", dict(list(self._get_all_weights(model_config, model))))
+
         if vllm_config.cache_config.cache_dtype == "fp8_inc":
             from neural_compressor.torch.algorithms.fp8_quant._quant_common.helper_modules import PatchedVLLMKVCache
             from neural_compressor.torch.algorithms.fp8_quant._quant_common.quant_config import Fp8cfg

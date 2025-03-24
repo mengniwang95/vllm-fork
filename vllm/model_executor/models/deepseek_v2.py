@@ -49,7 +49,7 @@ from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, maybe_remap_kv_scale_name)
+    default_weight_loader, maybe_remap_kv_scale_name, expert_weight_loader)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -760,6 +760,116 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                         dtype=dtype,
                         device=device),
         })
+
+    def load_weights_optional(self, weights: Dict, target_weights: Optional[list[str]]=[]
+                     ) -> Set[str]:
+        moe_n_slice = int(os.environ.get("VLLM_MOE_N_SLICE", 4))
+        stacked_params_mapping = {
+            "gate_up_proj": [("gate_proj", 0), ("up_proj", 1)],
+        }
+
+        expert_params_mapping = {
+            "w13_list": [
+                    ("w1", "gate_proj", expert_weight_loader, 0),
+                    ("w3", "up_proj", expert_weight_loader, 0),
+            ],
+            "w2_list": [
+                    ("w2", "down_proj", default_weight_loader, 1),
+            ],
+        }
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
+        for name in target_weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            # TODO(simon): support nextn predict layers
+            if hasattr(self.config, "num_nextn_predict_layers"
+                       ) and self.config.num_nextn_predict_layers > 0:
+                assert self.config.num_nextn_predict_layers == 1
+                layer_idx = self.config.num_hidden_layers
+                if name.startswith(f"model.layers.{layer_idx}"):
+                    continue
+
+            for param_name, shard_list in stacked_params_mapping.items():
+                # Skip non-stacked layers and experts (experts handled below).
+                if param_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if "mlp.experts." in name:
+                    continue
+
+                for (shard_name, shard_id) in shard_list:
+                    new_name = name.replace(param_name, shard_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if new_name.endswith(".bias"):
+                        continue
+
+                    if is_pp_missing_parameter(new_name, self):
+                        continue
+
+                    if new_name not in weights:
+                            continue
+
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, weights.pop(new_name), shard_id)
+                break
+            else:
+                for param_name, shard_list in expert_params_mapping.items():
+                    if param_name not in name or "experts.hpu_fused_moe.MoeOp" not in name:
+                        continue
+                    for shard_id, weight_name, weight_loader, shard_dim in shard_list:
+                        # model.layers.7.mlp.experts.hpu_fused_moe.MoeOp.0.w13_list.3.weight
+                        slice_id = int(name.split(".")[-4])
+                        slice_expert_id = int(name.split(".")[-2])
+                        expert_id = slice_id * moe_n_slice + slice_expert_id
+                        new_name = ".".join((name.split(".hpu_fused_moe")[0], str(expert_id), weight_name, "weight"))
+
+                        if is_pp_missing_parameter(new_name, self):
+                            continue
+
+                        # new_name should contain gate_proj
+                        if new_name not in weights:
+                            continue
+
+                        param = params_dict[name]
+                        if shard_id == "w2":
+                            weight_loader(param, weights.pop(new_name))
+                        else:
+                            weight_loader(param,
+                                          weights.pop(new_name),
+                                          shard_id=shard_id,
+                                          shard_dim=shard_dim)
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    # Remapping the name of FP8 kv-scale.
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+
+                    if is_pp_missing_parameter(name, self):
+                        continue
+
+                    if name not in weights:
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, weights.pop(name))
+            loaded_params.add(name)
+        return loaded_params
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:

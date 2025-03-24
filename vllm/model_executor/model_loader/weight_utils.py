@@ -689,3 +689,21 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
 
     # If there were no matches, return the untouched param name
     return name
+
+def expert_weight_loader(param: torch.Tensor,
+                         loaded_weight: torch.Tensor,
+                         shard_dim: int,
+                         shard_id: str) -> None:
+    tp_rank = get_tensor_model_parallel_rank()
+    if int(os.environ.get("VLLM_EP_SIZE", 1)) > 1:
+        tp_rank = tp_rank // int(os.environ.get("VLLM_EP_SIZE", 1))
+    shard_size = param.shape[shard_dim] // 2
+    loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank,
+                                         shard_size)
+    if shard_id == "w1":
+        param = param.narrow(shard_dim, 0, shard_size)
+    # w3, up_proj: Load into second logical weight of w13.
+    else:
+        assert shard_id == "w3"
+        param = param.narrow(shard_dim, shard_size, shard_size)
+    param.copy_(loaded_weight)

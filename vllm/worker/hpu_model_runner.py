@@ -818,6 +818,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         FP8Config, convert, prepare)
                     config = FP8Config.from_json_file(
                         os.getenv("QUANT_CONFIG", ""))
+                    print(self.model)
                     if config.measure:
                         self.model = prepare(self.model, config)
                     elif config.quantize:
@@ -827,6 +828,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 self.inc_initialized_successfully = True
                 logger.info("Preparing model with INC took %s",
                             m_inc.get_summary_string())
+                if torch.distributed.get_rank() == 0:
+                    import pdb;pdb.set_trace()
             elif not is_fake_hpu():
                 self.model = self.model.to("hpu")
                 htcore.mark_step()
