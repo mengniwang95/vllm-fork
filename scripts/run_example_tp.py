@@ -32,7 +32,7 @@ args = parser.parse_args()
 os.environ["VLLM_SKIP_WARMUP"] = "true"
 os.environ["HABANA_VISIBLE_DEVICES"] = "ALL"
 os.environ["PT_HPU_ENABLE_LAZY_COLLECTIVES"] = "true"
-os.environ["VLLM_MOE_N_SLICE"] = "1" if args.ep_size > 1 else "4"
+os.environ["VLLM_MOE_N_SLICE"] = "8" if args.ep_size > 1 else "4"
 os.environ["VLLM_EP_SIZE"] = f"{args.ep_size}"
 os.environ["VLLM_MLA_DISABLE_REQUANTIZATION"] = "1"
 os.environ["PT_HPU_WEIGHT_SHARING"] = "0"
@@ -162,9 +162,9 @@ if __name__ == "__main__":
         )
     else:
         prompts = [
-            "Hello, my name is",
-            "0.999 compares to 0.9 is ",
-            "The capital of France is",
+            # "Hello, my name is",
+            # "0.999 compares to 0.9 is ",
+            # "The capital of France is",
             "The future of AI is",
         ]
         if args.nprompts > 4:
@@ -195,7 +195,7 @@ if __name__ == "__main__":
             tensor_parallel_size=args.tp_size,
             distributed_executor_backend='mp',
             trust_remote_code=True,
-            max_model_len=16384,
+            max_model_len=2048,
             dtype="bfloat16",
             weights_load_device="cpu",
             quantization="inc",

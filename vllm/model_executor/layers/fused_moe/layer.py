@@ -34,23 +34,104 @@ else:
 logger = init_logger(__name__)
 
 LOW_CPU_MEM = os.environ.get("LOW_CPU_MEM", "0") == "1"
+class MoeMatmul(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+    def set_weight(self, w):
+        self.weight = w
+
+    def forward(self, state, expert_id, w):
+        raise NotImplementedError()
+
+
+class VllmMixtureOfExpertsOp(torch.nn.Module):
+
+    def __init__(self, num_total_experts):
+        super().__init__()
+        self.w13_list = torch.nn.ModuleList(
+            [MoeMatmul() for _ in range(num_total_experts)])
+        self.w2_list = torch.nn.ModuleList(
+            [MoeMatmul() for _ in range(num_total_experts)])
+        self.num_experts = num_total_experts
+
+    def forward(self,
+                hidden_states,
+                expert_routing_table,
+                router_weights,
+                permuted_weights=True,
+                activation="silu",
+                experts_min=0,
+                experts_max=7):
+        # pre-processing for custom op inputs
+        
+        experts_range = range(self.num_experts)
+        w1_list = [self.w13_list[i].weight.squeeze() for i in experts_range]
+        w2_list = [self.w2_list[i].weight.squeeze() for i in experts_range]
+        return torch.ops.hpu.mixture_of_experts(hidden_states=hidden_states,
+                                                expert_routing_table=expert_routing_table,
+                                                router_weights=router_weights,
+                                                w12=w1_list,
+                                                w3=w2_list,
+                                                permuted_weights=permuted_weights,
+                                                activation=activation,
+                                                experts_min=experts_min,
+                                                experts_max=experts_max)
+
+# class DynamicFusedMOE(torch.nn.Module):
+
+#     def __init__(self, num_total_experts, moe_n_slice):
+#         super().__init__()
+#         self.num_experts = num_total_experts
+#         self.moe_n_slice = moe_n_slice
+#         if self.moe_n_slice == 1:
+#             self.MoeOp = torch.nn.ModuleList(
+#                 [VllmMixtureOfExpertsOp(self.num_experts)]
+#             )
+#         else:
+#             assert self.num_experts % self.moe_n_slice == 0, "moe_n_slice can't be divided by {}".format(self.num_experts)
+#             self.MoeOp = torch.nn.ModuleList(
+#                 [VllmMixtureOfExpertsOp(self.num_experts // self.moe_n_slice) for _ in range(self.moe_n_slice)]
+#             )
+
+#     def forward(self, hidden_states, score, topk, experts_min=0, experts_max=7):
+#         htorch.core.mark_step()
+#         routing_weights = F.softmax(score, dim=1, dtype=torch.float32)
+#         routing_weights, selected_experts = torch.topk(routing_weights,
+#                                                         topk,
+#                                                         dim=-1)
+#         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+#         routing_weights = routing_weights.to(hidden_states.dtype)
+
+#         n_expert_slice = self.num_experts // self.moe_n_slice
+#         assert n_expert_slice * self.moe_n_slice == self.num_experts
+#         ep_shift = layer.ep_rank * self.num_experts
+#         for i in range(self.moe_n_slice):
+#             min_expert = i * n_expert_slice
+#             max_expert = (i + 1) * n_expert_slice
+#             current_hidden_states = self.MoeOp[i](
+#                 hidden_states=hidden_states,
+#                 expert_routing_table=selected_experts,
+#                 router_weights=routing_weights,
+#                 permuted_weights=True,
+#                 activation="silu",
+#                 experts_min=min_expert,
+#                 experts_max=max_expert,
+#             )
+#             htorch.core.mark_step()
+#             if i == 0:
+#                 final_hidden_states = current_hidden_states
+#             else:
+#                 final_hidden_states.add_(current_hidden_states)
+
+#         return final_hidden_states.view(-1, hidden_states.shape[1])
 
 class DynamicFusedMOE(torch.nn.Module):
 
-    def __init__(self, num_total_experts, moe_n_slice):
+    def __init__(self, num_total_experts):
         super().__init__()
-        # self.MoeOp = VllmMixtureOfExpertsOp(num_total_experts)
-        self.num_experts = num_total_experts
-        self.moe_n_slice = moe_n_slice
-        if self.moe_n_slice == 1:
-            self.MoeOp = torch.nn.ModuleList(
-                [VllmMixtureOfExpertsOp(self.num_experts)]
-            )
-        else:
-            assert self.num_experts % self.moe_n_slice == 0, "moe_n_slice can't be divided by {}".format(self.num_experts)
-            self.MoeOp = torch.nn.ModuleList(
-                [VllmMixtureOfExpertsOp(self.moe_n_slice) for _ in range(self.num_experts // self.moe_n_slice)]
-            )
+        self.MoeOp = VllmMixtureOfExpertsOp(num_total_experts)
 
     def forward(self, hidden_states, score, topk, experts_min=0, experts_max=7):
         htorch.core.mark_step()
@@ -61,25 +142,15 @@ class DynamicFusedMOE(torch.nn.Module):
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        n_expert_slice = self.num_experts // self.moe_n_slice
-        assert n_expert_slice * self.moe_n_slice == self.num_experts
-        for i in range(self.moe_n_slice):
-            min_expert = i * n_expert_slice
-            max_expert = (i + 1) * n_expert_slice
-            current_hidden_states = self.MoeOp[i](
-                hidden_states=hidden_states,
-                expert_routing_table=selected_experts,
-                router_weights=routing_weights,
-                permuted_weights=True,
-                activation="silu",
-                experts_min=min_expert,
-                experts_max=max_expert,
-            )
-            htorch.core.mark_step()
-            if i == 0:
-                final_hidden_states = current_hidden_states
-            else:
-                final_hidden_states.add_(current_hidden_states)
+        final_hidden_states = self.MoeOp(
+            hidden_states=hidden_states,
+            expert_routing_table=selected_experts,
+            router_weights=routing_weights,
+            permuted_weights=True,
+            activation="silu",
+            experts_min=experts_min,
+            experts_max=experts_max,
+        )
 
         return final_hidden_states.view(-1, hidden_states.shape[1])
 
@@ -234,7 +305,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         ep_rank = 0
     ):
-        x = x.reshape(x.shape[-1])
+        x = x.reshape(-1, x.shape[-1])
         assert len(x.shape) == 2
         import habana_frameworks.torch as htorch
         htorch.core.mark_step()
@@ -258,13 +329,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                                                         dim=-1)
             topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(x.dtype)
-        final_hidden_states = layer.hpu_fused_moe(
-            hidden_states=x,
-            expert_routing_table=topk_ids.to(torch.int64),
-            router_weights=topk_weights.to(x.dtype),
-            permuted_weights=True,
-            activation="silu",
-        )
+
+        ep_shift = layer.ep_rank * layer.num_experts
+        for i in range(layer.moe_n_slice):
+            moe = getattr(layer, f"hpu_fused_moe_{i}")
+            experts_min = i * layer.n_expert_slice
+            experts_max = (i + 1) * layer.n_expert_slice
+            print(get_tensor_model_parallel_rank(), layer.tp_size, experts_min, experts_max, ep_shift)
+            current_hidden_states = moe.MoeOp(
+                hidden_states=x,
+                expert_routing_table=topk_ids.to(torch.int64),
+                router_weights=topk_weights.to(x.dtype),
+                permuted_weights=True,
+                activation="silu",
+                experts_min=experts_min + ep_shift,
+                experts_max=experts_max - 1 + ep_shift,
+            )
+            htorch.core.mark_step()
+            if i == 0:
+                final_hidden_states = current_hidden_states
+            else:
+                final_hidden_states.add_(current_hidden_states)
         return final_hidden_states
 
     def forward_cpu(
@@ -421,24 +506,44 @@ class FusedMoE(torch.nn.Module):
         self.quant_method.create_weights(layer=self, **moe_quant_params)
         if is_hpu:
             # from vllm_hpu_extension.ops import DynamicFusedMOE
-            self.hpu_fused_moe = DynamicFusedMOE(self.num_experts, self.moe_n_slice)
+            # self.hpu_fused_moe = DynamicFusedMOE(self.num_experts, self.moe_n_slice)
+            # self.hpu_fused_moe = torch.nn.ModuleList(
+            #     [DynamicFusedMOE(self.num_experts // self.moe_n_slice) for _ in range(self.moe_n_slice)]
+            # )
+            for i in range(self.moe_n_slice):
+                setattr(self, f"hpu_fused_moe_{i}", DynamicFusedMOE(self.num_experts // self.moe_n_slice))
             if LOW_CPU_MEM:
                 for i in range(self.moe_n_slice):
                     for j in range(self.num_experts):
-                        self.hpu_fused_moe.MoeOp[i].w13_list[j % self.n_expert_slice].set_weight(
+                        moe = getattr(self, f"hpu_fused_moe_{i}")
+                        moe.MoeOp.w13_list[j % self.n_expert_slice].set_weight(
                             torch.nn.Parameter(torch.empty(
                              self.w13_weight[j].shape,
                              dtype=self.w13_weight[j].dtype,
                              ),
                                   requires_grad=False)
                         )
-                        self.hpu_fused_moe.MoeOp[i].w2_list[j % self.n_expert_slice].set_weight(
+                        moe.MoeOp.w2_list[j % self.n_expert_slice].set_weight(
                             torch.nn.Parameter(torch.empty(
                              self.w2_weight[j].shape,
                              dtype=self.w2_weight[j].dtype,
                              ),
                                   requires_grad=False)
                         )
+                        # self.hpu_fused_moe[i].MoeOp.w13_list[j % self.n_expert_slice].set_weight(
+                        #     torch.nn.Parameter(torch.empty(
+                        #      self.w13_weight[j].shape,
+                        #      dtype=self.w13_weight[j].dtype,
+                        #      ),
+                        #           requires_grad=False)
+                        # )
+                        # self.hpu_fused_moe[i].MoeOp.w2_list[j % self.n_expert_slice].set_weight(
+                        #     torch.nn.Parameter(torch.empty(
+                        #      self.w2_weight[j].shape,
+                        #      dtype=self.w2_weight[j].dtype,
+                        #      ),
+                        #           requires_grad=False)
+                        # )
 
     def _load_per_tensor_weight_scale(self, shard_id: str,
                                       param: torch.nn.Parameter,
@@ -553,8 +658,8 @@ class FusedMoE(torch.nn.Module):
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
 
-        # if is_hpu:
-        #     self.hpu_fused_moe.MoeOp[expert_id // self.n_expert_slice].w2_list[expert_id % self.n_expert_slice].weight.data = loaded_weight
+        if is_hpu and not LOW_CPU_MEM:
+            self.hpu_fused_moe.MoeOp[expert_id // self.n_expert_slice].w2_list[expert_id % self.n_expert_slice].weight.data = loaded_weight
             # print(f"loaded w2 for hpu for expert_id: {expert_id}, expert_data.shape: {expert_data.shape}")
 
     def _load_single_value(self, param: torch.nn.Parameter,

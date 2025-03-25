@@ -46,7 +46,7 @@ class MLACommonMetadata(AttentionMetadata):
     input_positions: torch.Tensor
 
 
-class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+class MLACommonImpl(MLAAttentionImpl[T], Generic[T], torch.nn.Module):
     """
     Common class for implementing repeated parts
 
@@ -165,6 +165,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         kv_b_proj: ColumnParallelLinear,
         o_proj: RowParallelLinear,
     ) -> None:
+        torch.nn.Module.__init__(self)
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -387,7 +388,11 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 self.W_UV_O_scales = W_UV_O_scales.T.contiguous()
             else:
                 self.W_UV_O = W_UV_O.to(act_dtype)
-
+            self.W_UV_O = torch.nn.Parameter(self.W_UV_O, requires_grad=False)
+            self.W_Q_UK = torch.nn.Parameter(self.W_Q_UK, requires_grad=False)
+            self.W_UK = torch.nn.Parameter(self.W_UK, requires_grad=False)
+            # self.W_QR
+            self.W_QR = torch.nn.Parameter(self.W_QR, requires_grad=False)
             self.tp_size = get_tensor_model_parallel_world_size()
         else:
             if is_fp8(weight_dtype):

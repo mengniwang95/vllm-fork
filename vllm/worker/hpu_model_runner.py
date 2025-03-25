@@ -818,7 +818,13 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         FP8Config, convert, prepare)
                     config = FP8Config.from_json_file(
                         os.getenv("QUANT_CONFIG", ""))
-                    print(self.model)
+                    # print(self.model)
+                    for layer in self.model.model.layers:
+                        self_attn = layer.self_attn
+                        # delete attrs: q_b_proj, kv_b_proj, o_proj in self_attn
+                        delattr(self_attn, "q_b_proj")
+                        delattr(self_attn, "kv_b_proj")
+                        delattr(self_attn, "o_proj")
                     if config.measure:
                         self.model = prepare(self.model, config)
                     elif config.quantize:

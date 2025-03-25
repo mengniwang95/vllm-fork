@@ -540,7 +540,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
+        # if torch.distributed.get_rank() == 0:
+        #     import pdb;pdb.set_trace()
         if model_config.use_mla:
+            # if torch.distributed.get_rank() == 0:
+            #     import pdb;pdb.set_trace()
             attn_cls = DeepseekV2MLAAttention
         else:
             attn_cls = DeepseekV2Attention
@@ -823,15 +827,16 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                 break
             else:
                 for param_name, shard_list in expert_params_mapping.items():
-                    if param_name not in name or "experts.hpu_fused_moe.MoeOp" not in name:
+                    if param_name not in name or "experts.hpu_fused_moe_" not in name:
                         continue
                     for shard_id, weight_name, weight_loader, shard_dim in shard_list:
-                        # model.layers.7.mlp.experts.hpu_fused_moe.MoeOp.0.w13_list.3.weight
-                        slice_id = int(name.split(".")[-4])
+                        # model.layers.7.mlp.experts.hpu_fused_moe.0.MoeOp.w13_list.3.weight
+                        # model.layers.7.mlp.experts._temp_expert_group_0.MoeOp.w13_list.0"
+                        slice_id = int(name.split(".")[-5].split("_")[-1])
                         slice_expert_id = int(name.split(".")[-2])
                         expert_id = slice_id * moe_n_slice + slice_expert_id
                         new_name = ".".join((name.split(".hpu_fused_moe")[0], str(expert_id), weight_name, "weight"))
-
+                        # print(new_name)
                         if is_pp_missing_parameter(new_name, self):
                             continue
 
@@ -927,6 +932,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -941,6 +947,8 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                     if name not in params_dict:
                         continue
 
+                    if LOW_CPU_MEM:
+                        break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param,
@@ -948,6 +956,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                                   name,
                                   shard_id=shard_id,
                                   expert_id=expert_id)
+                    loaded_params.add(name)
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -969,7 +978,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    loaded_params.add(name)
         return loaded_params
 
 
