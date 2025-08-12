@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 'Checkout Repository'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: 'Dependency Review'
         uses: actions/dependency-review-action@v4
         with:
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4      
+      uses: actions/checkout@v5      
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v3
       with:
@@ -40,7 +40,7 @@ jobs:
         tests_list: ${{ steps.tests.outputs.tests_list }}
     steps:
         - name: Checkout
-          uses: actions/checkout@v4
+          uses: actions/checkout@v5
         - name: Install YQ
           run: |
             wget https://github.com/mikefarah/yq/releases/download/v4.14.1/yq_linux_amd64.tar.gz -O - |\
