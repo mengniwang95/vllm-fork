@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     W4A16SPARSE24_SUPPORTED_BITS, WNA16_SUPPORTED_BITS, CompressedTensors24,
     CompressedTensorsScheme, CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A4MXFp4,
     CompressedTensorsW4A8Fp8, CompressedTensorsW4A8Int,
     CompressedTensorsW4A16Fp4, CompressedTensorsW4A16Sparse24,
     CompressedTensorsW8A8Fp8, CompressedTensorsW8A8Int8,
@@ -246,6 +247,24 @@ class CompressedTensorsConfig(QuantizationConfig):
             return supported
         else:
             return False
+
+    def _is_fp4a4_mxfp4(self, weight_quant: BaseModel, input_quant: BaseModel):
+        if weight_quant is None or input_quant is None:
+            return False
+        is_tensor_group_quant = (weight_quant.strategy
+                                 == QuantizationStrategy.TENSOR_GROUP.value
+                                 and input_quant.strategy
+                                 == QuantizationStrategy.TENSOR_GROUP.value)
+        is_symmetric = weight_quant.symmetric and input_quant.symmetric
+        is_group_size_32 = (weight_quant.group_size == 32
+                            and input_quant.group_size == 32)
+        is_float_type = (weight_quant.type == QuantizationType.FLOAT.value
+                         and input_quant.type == QuantizationType.FLOAT.value)
+        is_4_bits = weight_quant.num_bits == 4 and input_quant.num_bits == 4
+
+        return (is_tensor_group_quant and is_float_type and is_4_bits
+                and is_group_size_32 and is_symmetric)
+
 
     def _is_fp4a4_nvfp4(self, weight_quant: BaseModel, input_quant: BaseModel):
 
@@ -469,6 +488,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                         " Running CompressedTensorsW4A16Fp4.")
                     return CompressedTensorsW4A16Fp4(
                         has_input_global_scale=True)
+
+            if self._is_fp4a4_mxfp4(weight_quant, input_quant):
+               logger.warning_once(
+                   "Current platform does not support native MXFP4. "
+                   "Running CompressedTensorsW4A4MXFp4 via emulation.")
+               return CompressedTensorsW4A4MXFp4()
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
                 is_fp8_w8a8_supported = self._check_scheme_supported(
@@ -723,6 +748,50 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
 
         """
 
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights(layer, x, bias=bias)
+
+
+class CompressedTensorsMXFP4LinearMethod(LinearMethodBase):
+
+    def __init__(self, quantization_config: CompressedTensorsConfig):
+        self.quantization_config = quantization_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading(layer)
+
+    def create_weights(self, layer: torch.nn.Module,
+                       input_size_per_partition: int,
+                       output_partition_sizes: list[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype,
+                       **extra_weight_attrs):
+        """
+        Use the CompressedTensorsScheme associated with each layer to create
+        the necessary parameters for the layer. See LinearMethodBase for param
+        details
+        """
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.scheme.create_weights(
+            layer=layer,
+            input_size=input_size,
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            output_size=output_size,
+            params_dtype=params_dtype,
+            weight_loader=weight_loader)
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              bias: Optional[torch.Tensor] = None):
+        """
+        Use the output of create_weights and the CompressedTensorsScheme
+        associated with the layer to apply the forward pass with the
+        layer input.  See LinearMethodBase for param details
+
+        """
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")

@@ -123,6 +123,9 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     quant_config, layer.moe_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             return CompressedTensorsW4A4MoeMethod(layer.moe_config, layer)
+        elif quant_config._is_fp4a4_mxfp4(weight_quant, input_quant):
+            from .compressed_tensors_moe_mxfp4 import CompressedTensorsW4A4MXFP4MoeMethod
+            return CompressedTensorsW4A4MXFP4MoeMethod()
         elif (quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)
               or quant_config._is_fp8_w8a8_sm100(weight_quant, input_quant)
               or quant_config._is_fp8_w8a8(weight_quant, input_quant)):
