@@ -31,9 +31,7 @@ class CompressedTensorsW4A4MXFp4(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if envs.VLLM_USE_MXFP4_CT_EMULATIONS:
-            return 80
-        return 100
+        return 80
 
     def create_weights(
         self,
@@ -78,15 +76,18 @@ class CompressedTensorsW4A4MXFp4(CompressedTensorsScheme):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer) -> None:
-        weight_bf16 = to_dtype(
-            data_lp=layer.weight_packed,
-            scale_e8m0=layer.weight_scale,
-            elem_dtype=DTYPE_FP4_E2M1,
-            block_size=32,
-            target_dtype=torch.bfloat16,
-            use_fp4_custom_triton_dequant_kernel=False,
-            pack_fp6=False,
-        )
+        #weight_bf16 = to_dtype(
+        #    data_lp=layer.weight_packed,
+        #    scale_e8m0=layer.weight_scale,
+        #    elem_dtype=DTYPE_FP4_E2M1,
+        #    block_size=32,
+        #    target_dtype=torch.bfloat16,
+        #    use_fp4_custom_triton_dequant_kernel=False,
+        #    pack_fp6=False,
+        #)
+        weight_fp8, scale = dequant_mxfp4_to_fp8(layer.weight_packed, layer.weight_scale)
+        weight_bf16 = mxfp4_fp8_weight_to_bf16(weight_fp8, scale)
+
         del layer.weight_packed
         del layer.weight_scale
         layer.register_parameter(

@@ -35,6 +35,9 @@ class CompressedTensorsW4A4MXFP4MoeMethod(CompressedTensorsMoEMethod):
         self.use_marlin = False
         self.group_size = 32
 
+    def init_prepare_finalize(self, layer: torch.nn.Module):
+        pass
+
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
@@ -96,25 +99,30 @@ class CompressedTensorsW4A4MXFP4MoeMethod(CompressedTensorsMoEMethod):
         self.bt_threshold = 4096
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_weight_bf16 = to_dtype(
-            data_lp=layer.w13_weight_packed,
-            scale_e8m0=layer.w13_weight_scale,
-            elem_dtype=DTYPE_FP4_E2M1,
-            block_size=32,
-            target_dtype=torch.bfloat16,
-            use_fp4_custom_triton_dequant_kernel=False,
-            pack_fp6=False,
-        )
+        #w13_weight_bf16 = to_dtype(
+        #    data_lp=layer.w13_weight_packed,
+        #    scale_e8m0=layer.w13_weight_scale,
+        #    elem_dtype=DTYPE_FP4_E2M1,
+        #    block_size=32,
+        #    target_dtype=torch.bfloat16,
+        #    use_fp4_custom_triton_dequant_kernel=False,
+        #    pack_fp6=False,
+        #)
 
-        w2_weight_bf16 = to_dtype(
-            data_lp=layer.w2_weight_packed,
-            scale_e8m0=layer.w2_weight_scale,
-            elem_dtype=DTYPE_FP4_E2M1,
-            block_size=32,
-            target_dtype=torch.bfloat16,
-            use_fp4_custom_triton_dequant_kernel=False,
-            pack_fp6=False,
-        )
+        #w2_weight_bf16 = to_dtype(
+        #    data_lp=layer.w2_weight_packed,
+        #    scale_e8m0=layer.w2_weight_scale,
+        #    elem_dtype=DTYPE_FP4_E2M1,
+        #    block_size=32,
+        #    target_dtype=torch.bfloat16,
+        #    use_fp4_custom_triton_dequant_kernel=False,
+        #    pack_fp6=False,
+        #)
+        w13_weight_fp8, scale = dequant_mxfp4_to_fp8(layer.w13_weight_packed, layer.w13_weight_scale)
+        w13_weight_bf16 = mxfp4_fp8_weight_to_bf16(w13_weight_fp8, scale)
+
+        w2_weight_fp8, scale = dequant_mxfp4_to_fp8(layer.w2_weight_packed, layer.w2_weight_scale)
+        w2_weight_bf16 = mxfp4_fp8_weight_to_bf16(w2_weight_fp8, scale)
 
         delattr(layer, "w13_weight_packed")
         delattr(layer, "w13_weight_scale")
@@ -154,6 +162,7 @@ class CompressedTensorsW4A4MXFP4MoeMethod(CompressedTensorsMoEMethod):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
+        **kwargs,
     ):
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -201,7 +210,7 @@ class CompressedTensorsW4A4MXFP4MoeMethod(CompressedTensorsMoEMethod):
             current_state_static = x * mask_weight
 
             local_unpacked_w13 = layer.w13_weight_unpacked[expert_index]
-            local_w13_scale = layer.w13_weight_scale[expert_index]
+            #local_w13_scale = layer.w13_weight_scale[expert_index]
 
             local_unpacked_w2 = layer.w2_weight_unpacked[expert_index]
             #local_w2_scale = layer.w2_weight_scale[expert_index]
